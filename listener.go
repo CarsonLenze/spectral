@@ -37,14 +37,22 @@ func newListener(conn *udpConn) *Listener {
 			return nil
 		}
 
+		var (
+			c         *ServerConnection
+			newAccept bool
+		)
 		listener.connectionsMu.Lock()
-		defer listener.connectionsMu.Unlock()
 		c, ok := listener.connections[connectionID]
 		if !ok && slices.ContainsFunc(frames, func(fr frame.Frame) bool { return fr.ID() == frame.IDConnectionRequest }) {
 			c = newServerConnection(conn, dgram.peerAddr, listener.connectionID, listener.ctx)
 			c.logger.Log("connection_accepted", "addr", dgram.peerAddr.String())
 			listener.connections[listener.connectionID] = c
 			listener.connectionID++
+			newAccept = true
+		}
+		listener.connectionsMu.Unlock()
+
+		if newAccept {
 			listener.incomingConnections <- c
 			go func() {
 				<-c.ctx.Done()

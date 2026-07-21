@@ -8,7 +8,7 @@ import (
 
 const (
 	retransmissionAttempts = 20
-	maxBackoff             = 2 * time.Second
+	maxBackoff             = 1 * time.Second
 )
 
 type retransmissionEntry struct {
@@ -17,6 +17,12 @@ type retransmissionEntry struct {
 	sent       time.Time
 	attempts   int
 	backoff    time.Duration
+}
+
+type lostPacket struct {
+	payload []byte
+	sent    time.Time
+	gaveUp  bool
 }
 
 type retransmissionQueue struct {
@@ -61,7 +67,13 @@ func (r *retransmissionQueue) next(rto time.Duration) (t time.Time) {
 	return
 }
 
-func (r *retransmissionQueue) shift(now time.Time, rto time.Duration) (p []byte, t time.Time) {
+// shift returns the next packet due for retransmission. gaveUp is true when a
+// reliable packet has exhausted retransmissionAttempts: the connection can no
+// longer guarantee ordered delivery (the peer's streams have a permanent gap)
+// and the caller must tear the connection down loudly instead of silently
+// dropping the packet — the previous behavior left streams stalled forever
+// while the connection stayed "healthy".
+func (r *retransmissionQueue) shift(now time.Time, rto time.Duration) (p []byte, t time.Time, gaveUp bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.queue) == 0 {
@@ -88,12 +100,42 @@ func (r *retransmissionQueue) shift(now time.Time, rto time.Duration) (p []byte,
 		if entry.attempts >= retransmissionAttempts {
 			r.queue[0] = nil
 			r.queue = r.queue[1:]
-		} else {
-			r.queue = append(r.queue[1:], entry)
-			r.sort()
+			return entry.payload, sent, true
 		}
-		return entry.payload, sent
+		r.queue = append(r.queue[1:], entry)
+		r.sort()
+		return entry.payload, sent, false
 	}
+	return
+}
+
+func (r *retransmissionQueue) shiftLost(now time.Time, largestAcked, threshold uint32) (lost []lostPacket) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if largestAcked <= threshold || len(r.queue) == 0 {
+		return
+	}
+
+	limit := largestAcked - threshold
+	remaining := r.queue[:0]
+	for _, entry := range r.queue {
+		if entry.sequenceID > limit {
+			remaining = append(remaining, entry)
+			continue
+		}
+
+		sent := entry.sent
+		entry.sent = now
+		entry.attempts++
+		if entry.attempts >= retransmissionAttempts {
+			lost = append(lost, lostPacket{payload: entry.payload, sent: sent, gaveUp: true})
+			continue
+		}
+		lost = append(lost, lostPacket{payload: entry.payload, sent: sent})
+		remaining = append(remaining, entry)
+	}
+	r.queue = remaining
+	r.sort()
 	return
 }
 

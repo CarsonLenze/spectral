@@ -17,9 +17,11 @@ import (
 )
 
 const (
-	deadlineInf       = time.Duration(math.MaxInt64)
-	deadlineImmediate = protocol.TimerGranularity
-	inactivityTimeout = time.Second * 30
+	deadlineInf             = time.Duration(math.MaxInt64)
+	deadlineImmediate       = protocol.TimerGranularity
+	inactivityTimeout       = time.Second * 30
+	keepaliveInterval       = inactivityTimeout / 3
+	fastRetransmitThreshold = 3
 )
 
 type receivedPacket struct {
@@ -42,6 +44,7 @@ type connection struct {
 	peerAddr       *net.UDPAddr
 	connectionID   atomic.Int64
 	sequenceID     atomic.Uint32
+	largestAcked   uint32
 	ctx            context.Context
 	cancelFunc     context.CancelCauseFunc
 	sender         *congestion.Sender
@@ -56,6 +59,7 @@ type connection struct {
 	handler        func(frame.Frame) error
 	notify         chan struct{}
 	idle           time.Time
+	keepalive      time.Time
 	pacingDeadline time.Time
 	once           sync.Once
 	logger         log.Logger
@@ -79,6 +83,7 @@ func newConnection(conn *udpConn, peerAddr *net.UDPAddr, connectionID protocol.C
 		streams:        newStreamMap(),
 		notify:         make(chan struct{}, 1),
 		idle:           now.Add(inactivityTimeout),
+		keepalive:      now.Add(keepaliveInterval),
 		rtt:            congestion.NewRTT(),
 		logger:         logger,
 	}
@@ -141,6 +146,7 @@ runLoop:
 
 		nextDeadline := firstTime(
 			c.idle,
+			c.keepalive,
 			c.ack.next(),
 			c.retransmission.next(c.rtt.RTO()),
 			c.pacingDeadline,
@@ -162,6 +168,7 @@ runLoop:
 		case first := <-c.packets:
 			now = time.Now()
 			c.idle = now.Add(inactivityTimeout)
+			c.keepalive = now.Add(keepaliveInterval)
 			if err := c.receive(now, first.t, first.sequenceID, first.frames); err != nil {
 				break runLoop
 			}
@@ -197,11 +204,33 @@ runLoop:
 
 func (c *connection) triggerTimer(now time.Time) (err error) {
 	if !c.idle.After(now) {
-		_ = c.CloseWithError(frame.ConnectionCloseTimeout, "network inactivity")
-		return errors.New("network inactivity")
+		if len(c.packets) == 0 {
+			_ = c.CloseWithError(frame.ConnectionCloseTimeout, "network inactivity")
+			return errors.New("network inactivity")
+		}
+		c.idle = now.Add(inactivityTimeout)
 	}
 
-	if pk, t := c.retransmission.shift(now, c.rtt.RTO()); len(pk) > 0 {
+	if !c.keepalive.After(now) {
+		c.keepalive = now.Add(keepaliveInterval)
+		if err := c.writePing(now); err != nil {
+			return err
+		}
+	}
+
+	if pk, t, gaveUp := c.retransmission.shift(now, c.rtt.RTO()); len(pk) > 0 {
+		if gaveUp {
+			// A reliable packet exhausted its retransmission attempts. The
+			// peer has a permanent gap in a stream — every subsequent frame
+			// on it would park in the reorder queue forever. Fail loudly so
+			// the application (spectrum) can fall back / redial instead of
+			// serving frozen sessions. This also releases the packet's bytes
+			// from the congestion window, which previously leaked and could
+			// mute the connection permanently.
+			c.sender.OnAck(now, t, c.rtt, uint64(len(pk))-protocol.PacketHeaderSize)
+			_ = c.CloseWithError(frame.ConnectionCloseTimeout, "retransmission exhausted")
+			return errors.New("retransmission exhausted")
+		}
 		c.sender.OnCongestionEvent(now, t)
 		if _, err := c.writeDatagram(pk); err != nil {
 			return err
@@ -212,9 +241,23 @@ func (c *connection) triggerTimer(now time.Time) (err error) {
 
 func (c *connection) receive(now, t time.Time, sequenceID uint32, frames []frame.Frame) (err error) {
 	if sequenceID != 0 {
-		c.ack.add(t, sequenceID)
-		if !c.receiveQueue.add(sequenceID) {
+		switch c.receiveQueue.add(sequenceID) {
+		case receiveAccepted:
+			c.ack.add(t, sequenceID)
+		case receiveDuplicate:
+			// Re-ack: our previous acknowledgement may have been lost and the
+			// peer keeps retransmitting until it sees one.
+			c.ack.add(t, sequenceID)
 			c.logger.Log("duplicate_receive", "sequenceID", sequenceID)
+			releaseFrames(frames)
+			return
+		case receiveRejected:
+			// Outside the receive window / queue full. Deliberately NOT
+			// acked: the previous behavior (ack before add) made the sender
+			// forget the packet while we dropped it — silent permanent data
+			// loss and a stuck stream. Unacked, the peer retransmits it once
+			// the window advances.
+			c.logger.Log("rejected_receive", "sequenceID", sequenceID)
 			releaseFrames(frames)
 			return
 		}
@@ -250,6 +293,21 @@ func (c *connection) handle(now time.Time, fr frame.Frame) (err error) {
 					}
 					c.sender.OnAck(now, entry.sent, c.rtt, uint64(len(entry.payload))-protocol.PacketHeaderSize)
 				}
+			}
+		}
+
+		if fr.Max > c.largestAcked {
+			c.largestAcked = fr.Max
+		}
+		for _, lost := range c.retransmission.shiftLost(now, c.largestAcked, fastRetransmitThreshold) {
+			if lost.gaveUp {
+				c.sender.OnAck(now, lost.sent, c.rtt, uint64(len(lost.payload))-protocol.PacketHeaderSize)
+				_ = c.CloseWithError(frame.ConnectionCloseTimeout, "retransmission exhausted")
+				return errors.New("retransmission exhausted")
+			}
+			c.sender.OnCongestionEvent(now, lost.sent)
+			if _, err := c.writeDatagram(lost.payload); err != nil {
+				return err
 			}
 		}
 	case *frame.ConnectionClose:
@@ -377,6 +435,17 @@ func (c *connection) writeControl(fr frame.Frame, needsAck bool) (err error) {
 	return
 }
 
+func (c *connection) writePing(now time.Time) (err error) {
+	sequenceID := c.sequenceID.Add(1)
+	pk := frame.Pack(protocol.ConnectionID(c.connectionID.Load()), sequenceID, nil)
+	if _, err := c.writeDatagram(c.appendAcknowledgements(now, pk)); err != nil {
+		return err
+	}
+	c.retransmission.add(now, sequenceID, pk)
+	c.logger.Log("keepalive", "sequenceID", sequenceID)
+	return
+}
+
 func (c *connection) writeDatagram(p []byte) (int, error) {
 	select {
 	case <-c.ctx.Done():
@@ -420,8 +489,12 @@ func (c *connection) cleanup() {
 	clear(c.receiveQueue.queue)
 }
 
-func firstTime(idle, ack, retransmission, pacing time.Time) time.Time {
+func firstTime(idle, keepalive, ack, retransmission, pacing time.Time) time.Time {
 	deadline := idle
+	if !keepalive.IsZero() && keepalive.Before(deadline) {
+		deadline = keepalive
+	}
+
 	if !ack.IsZero() && ack.Before(deadline) {
 		deadline = ack
 	}
